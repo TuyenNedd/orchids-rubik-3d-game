@@ -149,6 +149,11 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
     intersectedCubieIndex: -1
   })
 
+  // Debug: Log when cubeState changes
+  useEffect(() => {
+    // console.log('Cube State Updated', cubeState[0].position, cubeState[0].colors)
+  }, [cubeState])
+
   // Animation Loop
   useFrame((state, delta) => {
     // Handle Animation
@@ -225,6 +230,8 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
          return Math.abs(pos[axis === 'x' ? 0 : axis === 'y' ? 1 : 2] - layer * 1.05) < 0.1
       })
 
+      // console.log(`Finishing move: ${axis} ${layer} ${dir}. Rotating ${indicesToRotate.length} cubies.`)
+
       indicesToRotate.forEach(i => {
         const cube = newState[i]
         const [x, y, z] = cube.position
@@ -263,6 +270,11 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
            }
         }
         
+        // Check for NaN positions
+        if (isNaN(newPos[0]) || isNaN(newPos[1]) || isNaN(newPos[2])) {
+            console.error('NaN position detected!', cube.position, newPos)
+        }
+
         cube.position = [
           Math.round(newPos[0] * 100) / 100,
           Math.round(newPos[1] * 100) / 100,
@@ -284,10 +296,20 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
     // Disable controls only if we hit a cube
     if (orbitControlsRef.current) orbitControlsRef.current.enabled = false
     
+    // Capture pointer to track drag even outside the cube
+    const target = e.target as HTMLElement
+    if (target.setPointerCapture) {
+      target.setPointerCapture(e.pointerId)
+    }
+
+    // Get World Normal
+    const normal = e.face.normal.clone()
+    normal.transformDirection(e.object.matrixWorld)
+
     interactionRef.current = {
       active: true,
       startPoint: e.point.clone(),
-      normal: e.face.normal.clone(),
+      normal: normal,
       intersectedCubieIndex: index
     }
   }
@@ -297,72 +319,119 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
     e.stopPropagation()
 
     const { startPoint, normal, intersectedCubieIndex } = interactionRef.current
-    const currentPoint = e.point.clone()
+    
+    // Calculate current point by intersecting ray with the drag plane
+    // This ensures smooth dragging even if the mouse leaves the cube geometry
+    let currentPoint = e.point ? e.point.clone() : new THREE.Vector3()
+    
+    if (e.ray) {
+        const ray = e.ray
+        const denominator = ray.direction.dot(normal)
+        if (Math.abs(denominator) > 0.0001) {
+            const t = startPoint.clone().sub(ray.origin).dot(normal) / denominator
+            if (t >= 0) {
+                currentPoint = ray.origin.clone().add(ray.direction.clone().multiplyScalar(t))
+            }
+        }
+    }
     
     const moveVector = currentPoint.clone().sub(startPoint)
     const dist = moveVector.length()
 
-    if (dist > 0.5) {
+    // Reduced threshold for better responsiveness
+    if (dist > 0.25) {
       // Get world axes
       const absNormal = new THREE.Vector3(Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z))
       
+      let moveAxis: 'x' | 'y' | 'z' | null = null
+      let moveDir: 1 | -1 = 1
+      let layer = 0
+
       if (absNormal.x > 0.8) { 
          // Right/Left Face
          if (Math.abs(moveVector.y) > Math.abs(moveVector.z)) {
-            // Drag Y -> Rotate X (Spin)
+            // Drag Y -> Rotate X (Spin the face? No. Rotate the layer corresponding to the face?)
+            // If I am on Right Face, and Drag Up. I want to rotate the Right Slice.
+            // Right Slice rotation is X-axis.
             const layerX = cubeState[intersectedCubieIndex].position[0]
-            const layer = Math.round(layerX / 1.05)
-            // Drag Up (Y+) on Right Face (X+) -> R Move (X -1? No. R is X-1? No.)
-            // R is X-axis rotation.
-            // Drag Up -> X rotation direction?
-            // (1, -1, 1) -> (1, 1, 1). Y increases.
-            // R move (Clockwise) moves Y 1->-1.
-            // So Drag Up is Inverse R.
-            // queueMove('x', layer, moveVector.y > 0 ? -1 : 1)
-            // Let's stick to standard sign.
-            queueMove('x', layer, moveVector.y > 0 ? -1 : 1)
+            layer = Math.round(layerX / 1.05)
+            moveAxis = 'x'
+            moveDir = moveVector.y > 0 ? -1 : 1
          } else {
-            // Drag Z -> Rotate Y (Move Face)
+            // Drag Z -> Rotate Y (Equatorial turn)
             const layerY = cubeState[intersectedCubieIndex].position[1]
-            const layer = Math.round(layerY / 1.05)
-            queueMove('y', layer, moveVector.z > 0 ? 1 : -1)
+            layer = Math.round(layerY / 1.05)
+            moveAxis = 'y'
+            moveDir = moveVector.z > 0 ? 1 : -1
          }
       } else if (absNormal.y > 0.8) {
          // Top/Bottom Face
          if (Math.abs(moveVector.x) > Math.abs(moveVector.z)) {
-            // Drag X -> Rotate Y (Spin? No. Rotate Y moves X -> Z. So Spin.)
-            const layerY = cubeState[intersectedCubieIndex].position[1]
-            const layer = Math.round(layerY / 1.05)
-            queueMove('y', layer, moveVector.x > 0 ? 1 : -1) // Check dir later
+            // Drag X -> Rotate Z (S turn)
+            const layerZ = cubeState[intersectedCubieIndex].position[2]
+            layer = Math.round(layerZ / 1.05)
+            moveAxis = 'z'
+            // Drag Right (X+) on Top Face -> Z axis rotation?
+            // Z rotation: X -> Y.
+            // Z dir -1 (Clockwise): X -> -Y.
+            // If I drag X+, I expect top face to move Right.
+            // Top face moving Right means Rotation around Y?
+            // NO. If I drag X on Top Face, I want to rotate the standing slice (S).
+            // That is Z axis.
+            moveAxis = 'z'
+            moveDir = moveVector.x > 0 ? -1 : 1
          } else {
-            // Drag Z -> Rotate X (Move Face)
+            // Drag Z -> Rotate X (M turn)
             const layerX = cubeState[intersectedCubieIndex].position[0]
-            const layer = Math.round(layerX / 1.05)
-            queueMove('x', layer, moveVector.z > 0 ? 1 : -1)
+            layer = Math.round(layerX / 1.05)
+            moveAxis = 'x'
+            moveDir = moveVector.z > 0 ? 1 : -1
          }
       } else {
          // Front/Back Face
          if (Math.abs(moveVector.x) > Math.abs(moveVector.y)) {
-            // Drag X -> Rotate Y
+            // Drag X -> Rotate Y (E turn)
             const layerY = cubeState[intersectedCubieIndex].position[1]
-            const layer = Math.round(layerY / 1.05)
-            queueMove('y', layer, moveVector.x > 0 ? 1 : -1)
+            layer = Math.round(layerY / 1.05)
+            moveAxis = 'y'
+            moveDir = moveVector.x > 0 ? 1 : -1
          } else {
-            // Drag Y -> Rotate X
+            // Drag Y -> Rotate X (M turn?) No, Rotate Z (face rotation)
+            // If I am on Front Face, drag Y.
+            // I want to rotate the Side slices (X axis)?
+            // Front Face. Drag Up. I want the Right/Left/Center Vertical slices to move.
+            // That is X axis rotation.
             const layerX = cubeState[intersectedCubieIndex].position[0]
-            const layer = Math.round(layerX / 1.05)
-            queueMove('x', layer, moveVector.y > 0 ? -1 : 1)
+            layer = Math.round(layerX / 1.05)
+            moveAxis = 'x'
+            moveDir = moveVector.y > 0 ? -1 : 1
          }
+      }
+
+      if (moveAxis) {
+          queueMove(moveAxis, layer, moveDir)
       }
 
       interactionRef.current.active = false
       if (orbitControlsRef.current) orbitControlsRef.current.enabled = true
+      
+      const target = e.target as HTMLElement
+      if (target.releasePointerCapture) {
+        target.releasePointerCapture(e.pointerId)
+      }
     }
   }
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (e: any) => {
     interactionRef.current.active = false
     if (orbitControlsRef.current) orbitControlsRef.current.enabled = true
+    
+    if (e && e.target) {
+        const target = e.target as HTMLElement
+        if (target.releasePointerCapture) {
+            target.releasePointerCapture(e.pointerId)
+        }
+    }
   }
 
   return (
@@ -374,7 +443,6 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
       <group 
          onPointerMove={handlePointerMove}
          onPointerUp={handlePointerUp}
-         onPointerLeave={handlePointerUp}
       >
          {cubeState.map((cube, i) => (
             <Cubie
