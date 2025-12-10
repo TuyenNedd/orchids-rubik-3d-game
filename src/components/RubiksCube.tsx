@@ -1,0 +1,487 @@
+'use client'
+
+import React, { useRef, useState, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
+import { OrbitControls, RoundedBox, Text } from '@react-three/drei'
+import * as THREE from 'three'
+
+// Colors based on standard Rubik's cube
+const COLORS = {
+  U: '#FFFFFF', // Up - White
+  D: '#FFD500', // Down - Yellow
+  F: '#009E60', // Front - Green
+  B: '#0051BA', // Back - Blue
+  R: '#C41E3A', // Right - Red
+  L: '#FF5800', // Left - Orange
+  CORE: '#111111' // Black plastic
+}
+
+type CubieProps = {
+  position: [number, number, number]
+  quaternion?: THREE.Quaternion
+  colors: (string | null)[]
+  id: number
+  onPointerDown?: (e: any) => void
+  onPointerMove?: (e: any) => void
+  onPointerUp?: (e: any) => void
+}
+
+const Cubie = forwardRef<THREE.Group, CubieProps>(({ position, colors, id, onPointerDown, onPointerMove, onPointerUp }, ref) => {
+  const localRef = useRef<THREE.Group>(null)
+  useImperativeHandle(ref, () => localRef.current!)
+  const [hovered, setHovered] = useState(false)
+
+  // Map index to face color
+  const faceColors = [
+    colors[0] ? COLORS.R : null, // Right (x=1)
+    colors[1] ? COLORS.L : null, // Left (x=-1)
+    colors[2] ? COLORS.U : null, // Top (y=1)
+    colors[3] ? COLORS.D : null, // Bottom (y=-1)
+    colors[4] ? COLORS.F : null, // Front (z=1)
+    colors[5] ? COLORS.B : null, // Back (z=-1)
+  ]
+  
+  const stickerSize = 0.88
+  const stickerOffset = 0.51
+
+  return (
+    <group
+      ref={localRef}
+      position={position}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerOver={(e) => { e.stopPropagation(); setHovered(true) }}
+      onPointerOut={(e) => { e.stopPropagation(); setHovered(false) }}
+    >
+      {/* Black plastic core */}
+      <RoundedBox args={[1, 1, 1]} radius={0.1} smoothness={4}>
+        <meshStandardMaterial color={COLORS.CORE} roughness={0.6} metalness={0.1} />
+      </RoundedBox>
+
+      {/* Stickers */}
+      {faceColors.map((color, i) => {
+        if (!color) return null
+        
+        const pos: [number, number, number] = [0, 0, 0]
+        const rot: [number, number, number] = [0, 0, 0]
+        
+        if (i === 0) { pos[0] = stickerOffset; rot[1] = Math.PI / 2 }
+        else if (i === 1) { pos[0] = -stickerOffset; rot[1] = -Math.PI / 2 }
+        else if (i === 2) { pos[1] = stickerOffset; rot[0] = -Math.PI / 2 }
+        else if (i === 3) { pos[1] = -stickerOffset; rot[0] = Math.PI / 2 }
+        else if (i === 4) { pos[2] = stickerOffset; }
+        else if (i === 5) { pos[2] = -stickerOffset; rot[1] = Math.PI }
+
+        return (
+          <group key={i} position={pos} rotation={rot}>
+             <RoundedBox args={[stickerSize, stickerSize, 0.02]} radius={0.05} smoothness={4}>
+                <meshStandardMaterial color={color} roughness={0.2} metalness={0.0} polygonOffset polygonOffsetFactor={-1} />
+             </RoundedBox>
+             {/* Logo on White Center */}
+             {color === COLORS.U && i === 2 && position[0] === 0 && position[2] === 0 && (
+                <Text
+                  position={[0, 0, 0.03]}
+                  fontSize={0.25}
+                  color="black"
+                  anchorX="center"
+                  anchorY="middle"
+                  rotation={[0, 0, 0]}
+                >
+                  RUBIKS{'\n'}CUBE
+                </Text>
+             )}
+          </group>
+        )
+      })}
+    </group>
+  )
+})
+Cubie.displayName = 'Cubie'
+
+type CubeState = {
+  position: [number, number, number]
+  colors: (string | null)[]
+}
+
+type Move = {
+  axis: 'x' | 'y' | 'z'
+  layer: number
+  dir: 1 | -1
+}
+
+type SceneProps = {
+  cubeState: CubeState[]
+  setCubeState: React.Dispatch<React.SetStateAction<CubeState[]>>
+  moveQueue: React.MutableRefObject<Move[]>
+}
+
+function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
+  const { camera, gl } = useThree()
+  const cubieRefs = useRef<(THREE.Group | null)[]>([])
+  const isAnimating = useRef(false)
+  const animationProgress = useRef(0)
+  const currentMove = useRef<Move | null>(null)
+  const prevAngle = useRef(0)
+  const orbitControlsRef = useRef<any>(null)
+  
+  // Interaction refs
+  const interactionRef = useRef({
+    active: false,
+    startPoint: new THREE.Vector3(),
+    normal: new THREE.Vector3(),
+    intersectedCubieIndex: -1
+  })
+
+  // Animation Loop
+  useFrame((state, delta) => {
+    // Handle Animation
+    if (isAnimating.current && currentMove.current) {
+      const speed = 4.0 // Animation speed
+      animationProgress.current += delta * speed
+      
+      if (animationProgress.current >= 1) {
+        animationProgress.current = 1
+      }
+
+      // Easing
+      const ease = (t: number) => 1 - Math.pow(1 - t, 3) // Cubic ease out
+      const currentAngle = ease(animationProgress.current) * (Math.PI / 2) * currentMove.current.dir
+      const deltaAngle = currentAngle - prevAngle.current
+      
+      // Apply rotation to active cubies
+      const { axis, layer } = currentMove.current
+      const axisVec = new THREE.Vector3(
+        axis === 'x' ? 1 : 0,
+        axis === 'y' ? 1 : 0,
+        axis === 'z' ? 1 : 0
+      )
+
+      cubieRefs.current.forEach((ref, i) => {
+        if (!ref) return
+        const logicalPos = cubeState[i].position
+        // Check if cubie is in the moving layer
+        const layerCoord = logicalPos[axis === 'x' ? 0 : axis === 'y' ? 1 : 2]
+        if (Math.abs(layerCoord - layer * 1.05) < 0.1) {
+           ref.position.applyAxisAngle(axisVec, deltaAngle)
+           ref.rotateOnWorldAxis(axisVec, deltaAngle)
+        }
+      })
+
+      prevAngle.current = currentAngle
+
+      if (animationProgress.current >= 1) {
+        // Animation Complete
+        isAnimating.current = false
+        finishMove(currentMove.current)
+        currentMove.current = null
+      }
+    } else if (moveQueue.current.length > 0) {
+      // Start Next Move
+      const nextMove = moveQueue.current.shift()!
+      currentMove.current = nextMove
+      isAnimating.current = true
+      animationProgress.current = 0
+      prevAngle.current = 0
+    }
+  })
+
+  const finishMove = (move: Move) => {
+    const { axis, layer, dir } = move
+    
+    // Update logical state
+    setCubeState(prev => {
+      const newState = prev.map(c => ({ ...c })) // Deepish copy
+      const cubesToRotateIndices = newState.map((c, i) => i).filter(i => {
+         const pos = newState[i].position
+         return Math.abs(pos[axis === 'x' ? 0 : axis === 'y' ? 1 : 2] - layer * 1.05) < 0.1
+      })
+
+      cubesToRotateIndices.forEach(i => {
+        const cube = newState[i]
+        const [x, y, z] = cube.position
+        
+        let newPos: [number, number, number] = [...cube.position]
+        
+        if (axis === 'x') {
+           if (dir === 1) {
+             newPos = [x, -z, y]
+             const [c0, c1, c2, c3, c4, c5] = cube.colors
+             cube.colors = [c0, c1, c4, c5, c3, c2]
+           } else {
+             newPos = [x, z, -y]
+             const [c0, c1, c2, c3, c4, c5] = cube.colors
+             cube.colors = [c0, c1, c5, c4, c2, c3]
+           }
+        } else if (axis === 'y') {
+           if (dir === 1) {
+             newPos = [z, y, -x]
+             const [c0, c1, c2, c3, c4, c5] = cube.colors
+             cube.colors = [c4, c5, c2, c3, c1, c0] 
+           } else {
+             newPos = [-z, y, x]
+             const [c0, c1, c2, c3, c4, c5] = cube.colors
+             cube.colors = [c5, c4, c2, c3, c0, c1]
+           }
+        } else {
+           if (dir === 1) {
+             newPos = [-y, x, z]
+             const [c0, c1, c2, c3, c4, c5] = cube.colors
+             cube.colors = [c2, c3, c1, c0, c4, c5]
+           } else {
+             newPos = [y, -x, z]
+             const [c0, c1, c2, c3, c4, c5] = cube.colors
+             cube.colors = [c3, c2, c0, c1, c4, c5]
+           }
+        }
+        
+        cube.position = [
+          Math.round(newPos[0] * 100) / 100,
+          Math.round(newPos[1] * 100) / 100,
+          Math.round(newPos[2] * 100) / 100
+        ]
+      })
+
+      return newState
+    })
+  }
+
+  const queueMove = (axis: 'x' | 'y' | 'z', layer: number, dir: 1 | -1) => {
+    moveQueue.current.push({ axis, layer, dir })
+  }
+
+  // Interaction Handlers
+  const handlePointerDown = (e: any, index: number) => {
+    e.stopPropagation()
+    if (orbitControlsRef.current) orbitControlsRef.current.enabled = false
+    
+    interactionRef.current = {
+      active: true,
+      startPoint: e.point.clone(),
+      normal: e.face.normal.clone(),
+      intersectedCubieIndex: index
+    }
+  }
+
+  const handlePointerMove = (e: any) => {
+    if (!interactionRef.current.active || !interactionRef.current.normal) return
+    e.stopPropagation()
+
+    const { startPoint, normal, intersectedCubieIndex } = interactionRef.current
+    const currentPoint = e.point.clone()
+    
+    const moveVector = currentPoint.clone().sub(startPoint)
+    const dist = moveVector.length()
+
+    if (dist > 0.5) {
+      // Get world axes
+      const xVec = new THREE.Vector3(1, 0, 0)
+      const yVec = new THREE.Vector3(0, 1, 0)
+      const zVec = new THREE.Vector3(0, 0, 1)
+
+      const absNormal = new THREE.Vector3(Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z))
+      
+      let moveAxis: 'x' | 'y' | 'z' = 'x'
+      let moveDir = 1
+
+      if (absNormal.x > 0.8) { 
+         if (Math.abs(moveVector.y) > Math.abs(moveVector.z)) {
+            const layerZ = cubeState[intersectedCubieIndex].position[2]
+            const layer = Math.round(layerZ / 1.05)
+            queueMove('z', layer, moveVector.y > 0 ? -1 : 1)
+         } else {
+            const layerY = cubeState[intersectedCubieIndex].position[1]
+            const layer = Math.round(layerY / 1.05)
+            queueMove('y', layer, moveVector.z > 0 ? 1 : -1)
+         }
+      } else if (absNormal.y > 0.8) {
+         if (Math.abs(moveVector.x) > Math.abs(moveVector.z)) {
+            const layerZ = cubeState[intersectedCubieIndex].position[2]
+            const layer = Math.round(layerZ / 1.05)
+            queueMove('z', layer, moveVector.x > 0 ? -1 : 1)
+         } else {
+            const layerX = cubeState[intersectedCubieIndex].position[0]
+            const layer = Math.round(layerX / 1.05)
+            queueMove('x', layer, moveVector.z > 0 ? 1 : -1)
+         }
+      } else {
+         if (Math.abs(moveVector.x) > Math.abs(moveVector.y)) {
+            const layerY = cubeState[intersectedCubieIndex].position[1]
+            const layer = Math.round(layerY / 1.05)
+            queueMove('y', layer, moveVector.x > 0 ? 1 : -1)
+         } else {
+            const layerX = cubeState[intersectedCubieIndex].position[0]
+            const layer = Math.round(layerX / 1.05)
+            queueMove('x', layer, moveVector.y > 0 ? -1 : 1)
+         }
+      }
+
+      interactionRef.current.active = false
+      if (orbitControlsRef.current) orbitControlsRef.current.enabled = true
+    }
+  }
+
+  const handlePointerUp = () => {
+    interactionRef.current.active = false
+    if (orbitControlsRef.current) orbitControlsRef.current.enabled = true
+  }
+
+  return (
+    <>
+      <ambientLight intensity={0.6} />
+      <directionalLight position={[10, 10, 5]} intensity={1.2} />
+      <directionalLight position={[-10, -10, -5]} intensity={0.5} />
+      
+      <group 
+         onPointerMove={handlePointerMove}
+         onPointerUp={handlePointerUp}
+         onPointerLeave={handlePointerUp}
+      >
+         {cubeState.map((cube, i) => (
+            <Cubie
+              key={i}
+              id={i}
+              ref={el => { cubieRefs.current[i] = el }}
+              position={cube.position}
+              colors={cube.colors}
+              onPointerDown={(e) => handlePointerDown(e, i)}
+            />
+         ))}
+      </group>
+      
+      <OrbitControls
+        ref={orbitControlsRef}
+        enablePan={false}
+        minDistance={4}
+        maxDistance={12}
+        enableDamping
+        dampingFactor={0.05}
+      />
+    </>
+  )
+}
+
+function Game() {
+  const [resetKey, setResetKey] = useState(0) // Key to force Scene remount
+  const [cubeState, setCubeState] = useState<CubeState[]>(() => {
+    const initialState: CubeState[] = []
+    for (let x = -1; x <= 1; x++) {
+      for (let y = -1; y <= 1; y++) {
+        for (let z = -1; z <= 1; z++) {
+          const colors: (string | null)[] = [
+            x === 1 ? '0' : null,
+            x === -1 ? '1' : null,
+            y === 1 ? '2' : null,
+            y === -1 ? '3' : null,
+            z === 1 ? '4' : null,
+            z === -1 ? '5' : null,
+          ]
+          initialState.push({ position: [x * 1.05, y * 1.05, z * 1.05], colors })
+        }
+      }
+    }
+    return initialState
+  })
+
+  const moveQueue = useRef<Move[]>([])
+
+  const queueMove = (axis: 'x' | 'y' | 'z', layer: number, dir: 1 | -1) => {
+    moveQueue.current.push({ axis, layer, dir })
+  }
+
+  const scramble = () => {
+    const axes: ('x' | 'y' | 'z')[] = ['x', 'y', 'z']
+    const layers = [-1, 0, 1]
+    const dirs: (1 | -1)[] = [1, -1]
+    
+    for (let i = 0; i < 20; i++) {
+        const randomAxis = axes[Math.floor(Math.random() * axes.length)]
+        const randomLayer = layers[Math.floor(Math.random() * layers.length)]
+        const randomDir = dirs[Math.floor(Math.random() * dirs.length)]
+        moveQueue.current.push({ axis: randomAxis, layer: randomLayer, dir: randomDir })
+    }
+  }
+
+  const reset = () => {
+    moveQueue.current = []
+    setResetKey(prev => prev + 1) // Force Scene remount
+    
+    const initialState: CubeState[] = []
+    for (let x = -1; x <= 1; x++) {
+      for (let y = -1; y <= 1; y++) {
+        for (let z = -1; z <= 1; z++) {
+          const colors: (string | null)[] = [
+            x === 1 ? '0' : null,
+            x === -1 ? '1' : null,
+            y === 1 ? '2' : null,
+            y === -1 ? '3' : null,
+            z === 1 ? '4' : null,
+            z === -1 ? '5' : null,
+          ]
+          initialState.push({ position: [x * 1.05, y * 1.05, z * 1.05], colors })
+        }
+      }
+    }
+    setCubeState(initialState)
+  }
+
+  return (
+    <div className="w-full h-full flex flex-col gap-6">
+      <div className="w-full h-[600px] bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 rounded-2xl shadow-2xl overflow-hidden relative">
+        <Canvas camera={{ position: [5, 5, 5], fov: 45 }}>
+          <Scene key={resetKey} cubeState={cubeState} setCubeState={setCubeState} moveQueue={moveQueue} />
+        </Canvas>
+        
+        {/* Instructions Overlay */}
+        <div className="absolute top-4 left-4 bg-black/50 backdrop-blur-md p-4 rounded-xl text-white/80 text-sm pointer-events-none select-none">
+           <p className="font-bold mb-1">Controls:</p>
+           <ul className="list-disc pl-4 space-y-1">
+             <li>Drag on cube to rotate layers</li>
+             <li>Drag background to rotate view</li>
+           </ul>
+        </div>
+      </div>
+
+      <div className="flex gap-4 justify-center flex-wrap">
+        <button onClick={() => queueMove('x', -1, 1)} className="btn bg-red-600">L</button>
+        <button onClick={() => queueMove('x', -1, -1)} className="btn bg-red-600">L'</button>
+        <button onClick={() => queueMove('x', 1, 1)} className="btn bg-red-600">R</button>
+        <button onClick={() => queueMove('x', 1, -1)} className="btn bg-red-600">R'</button>
+        
+        <button onClick={() => queueMove('y', 1, 1)} className="btn bg-blue-600">U</button>
+        <button onClick={() => queueMove('y', 1, -1)} className="btn bg-blue-600">U'</button>
+        <button onClick={() => queueMove('y', -1, 1)} className="btn bg-blue-600">D</button>
+        <button onClick={() => queueMove('y', -1, -1)} className="btn bg-blue-600">D'</button>
+        
+        <button onClick={() => queueMove('z', 1, 1)} className="btn bg-green-600">F</button>
+        <button onClick={() => queueMove('z', 1, -1)} className="btn bg-green-600">F'</button>
+        <button onClick={() => queueMove('z', -1, 1)} className="btn bg-green-600">B</button>
+        <button onClick={() => queueMove('z', -1, -1)} className="btn bg-green-600">B'</button>
+
+        <button onClick={scramble} className="btn bg-yellow-600 font-bold px-6">Scramble</button>
+        <button onClick={reset} className="btn bg-purple-600 font-bold px-6">Reset</button>
+      </div>
+      
+      <style jsx>{`
+        .btn {
+          padding: 0.5rem 1rem;
+          color: white;
+          border-radius: 0.5rem;
+          font-weight: 600;
+          transition: all 0.2s;
+          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        .btn:hover {
+          transform: translateY(-2px);
+          filter: brightness(110%);
+          box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.2);
+        }
+        .btn:active {
+          transform: translateY(0);
+        }
+      `}</style>
+    </div>
+  )
+}
+
+export const RubiksCube = Game
