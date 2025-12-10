@@ -16,6 +16,15 @@ const COLORS = {
   CORE: '#111111' // Black plastic
 }
 
+const ID_TO_COLOR: Record<string, string> = {
+  '0': COLORS.R,
+  '1': COLORS.L,
+  '2': COLORS.U,
+  '3': COLORS.D,
+  '4': COLORS.F,
+  '5': COLORS.B,
+}
+
 type CubieProps = {
   position: [number, number, number]
   quaternion?: THREE.Quaternion
@@ -26,20 +35,16 @@ type CubieProps = {
   onPointerUp?: (e: any) => void
 }
 
-const Cubie = forwardRef<THREE.Group, CubieProps>(({ position, colors, id, onPointerDown, onPointerMove, onPointerUp }, ref) => {
+const Cubie = forwardRef<THREE.Group, CubieProps>(({ position, colors, id, onPointerDown, onPointerMove, onPointerUp, quaternion }, ref) => {
   const localRef = useRef<THREE.Group>(null)
   useImperativeHandle(ref, () => localRef.current!)
   const [hovered, setHovered] = useState(false)
+  
+  // Use a default quaternion if none provided, but we expect one passed from parent
+  const defaultQuaternion = useMemo(() => new THREE.Quaternion(), [])
 
-  // Map index to face color
-  const faceColors = [
-    colors[0] ? COLORS.R : null, // Right (x=1)
-    colors[1] ? COLORS.L : null, // Left (x=-1)
-    colors[2] ? COLORS.U : null, // Top (y=1)
-    colors[3] ? COLORS.D : null, // Bottom (y=-1)
-    colors[4] ? COLORS.F : null, // Front (z=1)
-    colors[5] ? COLORS.B : null, // Back (z=-1)
-  ]
+  // Map index to face color based on sticker ID
+  const faceColors = colors.map(c => c ? ID_TO_COLOR[c] : null)
   
   const stickerSize = 0.88
   const stickerOffset = 0.51
@@ -48,6 +53,7 @@ const Cubie = forwardRef<THREE.Group, CubieProps>(({ position, colors, id, onPoi
     <group
       ref={localRef}
       position={position}
+      quaternion={quaternion || defaultQuaternion}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -73,13 +79,18 @@ const Cubie = forwardRef<THREE.Group, CubieProps>(({ position, colors, id, onPoi
         else if (i === 4) { pos[2] = stickerOffset; }
         else if (i === 5) { pos[2] = -stickerOffset; rot[1] = Math.PI }
 
+        // Check for center logo condition:
+        // 1. Color is White (COLORS.U)
+        // 2. This cubie only has ONE sticker (it is a center piece)
+        const isCenterPiece = colors.filter(c => c).length === 1
+
         return (
           <group key={i} position={pos} rotation={rot}>
              <RoundedBox args={[stickerSize, stickerSize, 0.02]} radius={0.05} smoothness={4}>
                 <meshStandardMaterial color={color} roughness={0.2} metalness={0.0} polygonOffset polygonOffsetFactor={-1} />
              </RoundedBox>
              {/* Logo on White Center */}
-             {color === COLORS.U && i === 2 && position[0] === 0 && position[2] === 0 && (
+             {color === COLORS.U && isCenterPiece && (
                 <Text
                   position={[0, 0, 0.03]}
                   fontSize={0.25}
@@ -125,6 +136,11 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
   const prevAngle = useRef(0)
   const orbitControlsRef = useRef<any>(null)
   
+  // Create a new identity quaternion every render to force prop updates on Cubies
+  // This ensures that after an animation (where the THREE object was manually rotated),
+  // the rotation is strictly reset to 0 when the React state updates.
+  const identityQuaternion = new THREE.Quaternion()
+  
   // Interaction refs
   const interactionRef = useRef({
     active: false,
@@ -144,9 +160,11 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
         animationProgress.current = 1
       }
 
-      // Easing
-      const ease = (t: number) => 1 - Math.pow(1 - t, 3) // Cubic ease out
-      const currentAngle = ease(animationProgress.current) * (Math.PI / 2) * currentMove.current.dir
+      // Easing - EaseInOutCubic for smoothness
+      const t = animationProgress.current
+      const easedT = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
+      const currentAngle = easedT * (Math.PI / 2) * currentMove.current.dir
+      
       const deltaAngle = currentAngle - prevAngle.current
       
       // Apply rotation to active cubies
@@ -189,15 +207,25 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
   const finishMove = (move: Move) => {
     const { axis, layer, dir } = move
     
-    // Update logical state
+    // Update Logical State
+    // We do NOT manually reset the THREE objects here anymore.
+    // We rely on React to re-render the Scene with the new cubeState.
+    // Since we pass a fresh identityQuaternion to Cubie, Three-fiber will reset the rotation to 0.
+    // The visual transition from "Rotated State" to "New Position + 0 Rotation" should be seamless.
+    
     setCubeState(prev => {
-      const newState = prev.map(c => ({ ...c })) // Deepish copy
-      const cubesToRotateIndices = newState.map((c, i) => i).filter(i => {
+      const newState = prev.map(c => ({ 
+          ...c,
+          position: [...c.position] as [number, number, number],
+          colors: [...c.colors]
+      }))
+      
+      const indicesToRotate = newState.map((c, i) => i).filter(i => {
          const pos = newState[i].position
          return Math.abs(pos[axis === 'x' ? 0 : axis === 'y' ? 1 : 2] - layer * 1.05) < 0.1
       })
 
-      cubesToRotateIndices.forEach(i => {
+      indicesToRotate.forEach(i => {
         const cube = newState[i]
         const [x, y, z] = cube.position
         
@@ -207,11 +235,11 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
            if (dir === 1) {
              newPos = [x, -z, y]
              const [c0, c1, c2, c3, c4, c5] = cube.colors
-             cube.colors = [c0, c1, c4, c5, c3, c2]
+             cube.colors = [c0, c1, c5, c4, c2, c3]
            } else {
              newPos = [x, z, -y]
              const [c0, c1, c2, c3, c4, c5] = cube.colors
-             cube.colors = [c0, c1, c5, c4, c2, c3]
+             cube.colors = [c0, c1, c4, c5, c3, c2]
            }
         } else if (axis === 'y') {
            if (dir === 1) {
@@ -227,11 +255,11 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
            if (dir === 1) {
              newPos = [-y, x, z]
              const [c0, c1, c2, c3, c4, c5] = cube.colors
-             cube.colors = [c2, c3, c1, c0, c4, c5]
+             cube.colors = [c3, c2, c0, c1, c4, c5]
            } else {
              newPos = [y, -x, z]
              const [c0, c1, c2, c3, c4, c5] = cube.colors
-             cube.colors = [c3, c2, c0, c1, c4, c5]
+             cube.colors = [c2, c3, c1, c0, c4, c5]
            }
         }
         
@@ -253,6 +281,7 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
   // Interaction Handlers
   const handlePointerDown = (e: any, index: number) => {
     e.stopPropagation()
+    // Disable controls only if we hit a cube
     if (orbitControlsRef.current) orbitControlsRef.current.enabled = false
     
     interactionRef.current = {
@@ -275,41 +304,51 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
 
     if (dist > 0.5) {
       // Get world axes
-      const xVec = new THREE.Vector3(1, 0, 0)
-      const yVec = new THREE.Vector3(0, 1, 0)
-      const zVec = new THREE.Vector3(0, 0, 1)
-
       const absNormal = new THREE.Vector3(Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z))
       
-      let moveAxis: 'x' | 'y' | 'z' = 'x'
-      let moveDir = 1
-
       if (absNormal.x > 0.8) { 
+         // Right/Left Face
          if (Math.abs(moveVector.y) > Math.abs(moveVector.z)) {
-            const layerZ = cubeState[intersectedCubieIndex].position[2]
-            const layer = Math.round(layerZ / 1.05)
-            queueMove('z', layer, moveVector.y > 0 ? -1 : 1)
+            // Drag Y -> Rotate X (Spin)
+            const layerX = cubeState[intersectedCubieIndex].position[0]
+            const layer = Math.round(layerX / 1.05)
+            // Drag Up (Y+) on Right Face (X+) -> R Move (X -1? No. R is X-1? No.)
+            // R is X-axis rotation.
+            // Drag Up -> X rotation direction?
+            // (1, -1, 1) -> (1, 1, 1). Y increases.
+            // R move (Clockwise) moves Y 1->-1.
+            // So Drag Up is Inverse R.
+            // queueMove('x', layer, moveVector.y > 0 ? -1 : 1)
+            // Let's stick to standard sign.
+            queueMove('x', layer, moveVector.y > 0 ? -1 : 1)
          } else {
+            // Drag Z -> Rotate Y (Move Face)
             const layerY = cubeState[intersectedCubieIndex].position[1]
             const layer = Math.round(layerY / 1.05)
             queueMove('y', layer, moveVector.z > 0 ? 1 : -1)
          }
       } else if (absNormal.y > 0.8) {
+         // Top/Bottom Face
          if (Math.abs(moveVector.x) > Math.abs(moveVector.z)) {
-            const layerZ = cubeState[intersectedCubieIndex].position[2]
-            const layer = Math.round(layerZ / 1.05)
-            queueMove('z', layer, moveVector.x > 0 ? -1 : 1)
+            // Drag X -> Rotate Y (Spin? No. Rotate Y moves X -> Z. So Spin.)
+            const layerY = cubeState[intersectedCubieIndex].position[1]
+            const layer = Math.round(layerY / 1.05)
+            queueMove('y', layer, moveVector.x > 0 ? 1 : -1) // Check dir later
          } else {
+            // Drag Z -> Rotate X (Move Face)
             const layerX = cubeState[intersectedCubieIndex].position[0]
             const layer = Math.round(layerX / 1.05)
             queueMove('x', layer, moveVector.z > 0 ? 1 : -1)
          }
       } else {
+         // Front/Back Face
          if (Math.abs(moveVector.x) > Math.abs(moveVector.y)) {
+            // Drag X -> Rotate Y
             const layerY = cubeState[intersectedCubieIndex].position[1]
             const layer = Math.round(layerY / 1.05)
             queueMove('y', layer, moveVector.x > 0 ? 1 : -1)
          } else {
+            // Drag Y -> Rotate X
             const layerX = cubeState[intersectedCubieIndex].position[0]
             const layer = Math.round(layerX / 1.05)
             queueMove('x', layer, moveVector.y > 0 ? -1 : 1)
@@ -345,6 +384,7 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
               position={cube.position}
               colors={cube.colors}
               onPointerDown={(e) => handlePointerDown(e, i)}
+              quaternion={identityQuaternion}
             />
          ))}
       </group>
