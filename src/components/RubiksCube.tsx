@@ -318,98 +318,116 @@ function Scene({ cubeState, setCubeState, moveQueue }: SceneProps) {
         const rect = gl.domElement.getBoundingClientRect()
         const x = ((event.clientX - rect.left) / rect.width) * 2 - 1
         const y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+        const currentNDC = new THREE.Vector2(x, y)
         
-        // Create Raycaster
-        const raycaster = new THREE.Raycaster()
-        raycaster.setFromCamera({ x, y }, camera)
+        // Project start point to NDC
+        const startPointNDC = interactionRef.current.startPoint.clone().project(camera)
+        const startNDC = new THREE.Vector2(startPointNDC.x, startPointNDC.y)
         
-        // Intersect with the drag plane
-        // Plane defined by normal and startPoint
-        const planeNormal = normal.clone()
-        const planeConstant = -startPoint.dot(planeNormal)
-        const plane = new THREE.Plane(planeNormal, planeConstant)
-        
-        const ray = raycaster.ray
-        const target = new THREE.Vector3()
-        const intersection = ray.intersectPlane(plane, target)
-        
-        let currentPoint = startPoint.clone()
-        if (intersection) {
-            currentPoint = intersection
-        }
-        
-        const moveVector = currentPoint.clone().sub(startPoint)
-        const dist = moveVector.length()
+        const dragVec = currentNDC.clone().sub(startNDC)
+        const dist = dragVec.length()
 
-        // Threshold for move detection
-        if (dist > 0.25) {
+        // Threshold for move detection (NDC space)
+        if (dist > 0.05) {
+          const normal = interactionRef.current.normal
           const absNormal = new THREE.Vector3(Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z))
           
           let moveAxis: 'x' | 'y' | 'z' | null = null
           let moveDir: 1 | -1 = 1
           let layer = 0
           
-          // Re-access state from closure (safe since handlePointerDown is created in render)
-          // But cubeState might have changed if re-render happened? 
-          // Actually, handlePointerDown closes over the 'cubeState' variable from the render where it was defined.
-          // Since we use the index, we need the cubeState that matches the visual cubes.
-          // This is generally safe as interaction is short.
+          // Re-access state
+          const index = interactionRef.current.intersectedCubieIndex
+          const cube = cubeState[index]
+          
+          // Helper to determine axis dominance in screen space
+          const checkAxes = (
+            axis1: THREE.Vector3, axis1Name: 'x' | 'y' | 'z', 
+            axis2: THREE.Vector3, axis2Name: 'x' | 'y' | 'z'
+          ) => {
+             // Project World Axes to Screen Space
+             const p1 = interactionRef.current.startPoint.clone().add(axis1).project(camera)
+             const v1 = new THREE.Vector2(p1.x, p1.y).sub(startNDC).normalize()
+             const dot1 = dragVec.clone().normalize().dot(v1)
+             
+             const p2 = interactionRef.current.startPoint.clone().add(axis2).project(camera)
+             const v2 = new THREE.Vector2(p2.x, p2.y).sub(startNDC).normalize()
+             const dot2 = dragVec.clone().normalize().dot(v2)
+             
+             if (Math.abs(dot1) > Math.abs(dot2)) {
+                 return { axis: axis1Name, dot: dot1 }
+             } else {
+                 return { axis: axis2Name, dot: dot2 }
+             }
+          }
           
           if (absNormal.x > 0.8) { 
              // Right/Left Face
-             const sign = Math.sign(normal.x)
-             if (Math.abs(moveVector.y) > Math.abs(moveVector.z)) {
-                // Drag Y -> Rotate X (Face Rotation/Spin)
-                const layerX = cubeState[interactionRef.current.intersectedCubieIndex].position[0]
-                layer = Math.round(layerX / 1.05)
+             // Tangents: Y (0,1,0) and Z (0,0,1)
+             const result = checkAxes(new THREE.Vector3(0,1,0), 'y', new THREE.Vector3(0,0,1), 'z')
+             
+             if (result.axis === 'y') {
+                // Dragging along World Y -> Rotate X (Face Rotation)
                 moveAxis = 'x'
+                layer = Math.round(cube.position[0] / 1.05)
                 
-                // For Face Rotation, direction depends on which side of the face we are dragging (Z axis)
-                // Front side (Z > 0): Drag Up -> Rotate X- (Front moves Up)
-                // Back side (Z < 0): Drag Up -> Rotate X+ (Back moves Up)
                 const zSign = Math.sign(interactionRef.current.startPoint.z) || 1
-                moveDir = (moveVector.y > 0 ? -1 : 1) * zSign as 1 | -1
+                const dragDir = Math.sign(result.dot)
+                moveDir = (dragDir === 1 ? -1 : 1) * zSign as 1 | -1
              } else {
-                // Drag Z -> Rotate Y (Top/Bottom Slice Rotation)
-                const layerY = cubeState[interactionRef.current.intersectedCubieIndex].position[1]
-                layer = Math.round(layerY / 1.05)
+                // Dragging along World Z -> Rotate Y (Slice Rotation)
                 moveAxis = 'y'
-                // Fix: Horizontal drag direction was reversed
-                // Drag Left (Screen) corresponds to Z+ on Right Face and Z- on Left Face
-                // But both should result in Face moving Left (Y+ Rotation)
-                moveDir = (moveVector.z > 0 ? -1 : 1) * sign as 1 | -1
+                layer = Math.round(cube.position[1] / 1.05)
+                
+                const sign = Math.sign(normal.x)
+                const dragDir = Math.sign(result.dot)
+                moveDir = (dragDir === 1 ? -1 : 1) * sign as 1 | -1
              }
+             
           } else if (absNormal.y > 0.8) {
              // Top/Bottom Face
-             const sign = Math.sign(normal.y)
-             if (Math.abs(moveVector.x) > Math.abs(moveVector.z)) {
-                // Drag X -> Rotate Z
-                const layerZ = cubeState[interactionRef.current.intersectedCubieIndex].position[2]
-                layer = Math.round(layerZ / 1.05)
+             // Tangents: X (1,0,0) and Z (0,0,1)
+             const result = checkAxes(new THREE.Vector3(1,0,0), 'x', new THREE.Vector3(0,0,1), 'z')
+             
+             if (result.axis === 'x') {
+                // Dragging along World X -> Rotate Z
                 moveAxis = 'z'
-                moveDir = (moveVector.x > 0 ? -1 : 1) * sign as 1 | -1
+                layer = Math.round(cube.position[2] / 1.05)
+                
+                const sign = Math.sign(normal.y)
+                const dragDir = Math.sign(result.dot)
+                moveDir = (dragDir === 1 ? -1 : 1) * sign as 1 | -1
              } else {
-                // Drag Z -> Rotate X
-                const layerX = cubeState[interactionRef.current.intersectedCubieIndex].position[0]
-                layer = Math.round(layerX / 1.05)
+                // Dragging along World Z -> Rotate X
                 moveAxis = 'x'
-                moveDir = (moveVector.z > 0 ? 1 : -1) * sign as 1 | -1
+                layer = Math.round(cube.position[0] / 1.05)
+                
+                const sign = Math.sign(normal.y)
+                const dragDir = Math.sign(result.dot)
+                moveDir = (dragDir === 1 ? 1 : -1) * sign as 1 | -1
              }
+
           } else {
              // Front/Back Face
-             const sign = Math.sign(normal.z)
-             if (Math.abs(moveVector.x) > Math.abs(moveVector.y)) {
-                // Drag X -> Rotate Y
-                const layerY = cubeState[interactionRef.current.intersectedCubieIndex].position[1]
-                layer = Math.round(layerY / 1.05)
+             // Tangents: X (1,0,0) and Y (0,1,0)
+             const result = checkAxes(new THREE.Vector3(1,0,0), 'x', new THREE.Vector3(0,1,0), 'y')
+             
+             if (result.axis === 'x') {
+                // Dragging along World X -> Rotate Y
                 moveAxis = 'y'
-                moveDir = (moveVector.x > 0 ? 1 : -1) * sign as 1 | -1
+                layer = Math.round(cube.position[1] / 1.05)
+                
+                const sign = Math.sign(normal.z)
+                const dragDir = Math.sign(result.dot)
+                moveDir = (dragDir === 1 ? 1 : -1) * sign as 1 | -1
              } else {
-                // Drag Y -> Rotate X
-                const layerX = cubeState[interactionRef.current.intersectedCubieIndex].position[0]
-                layer = Math.round(layerX / 1.05)
+                // Dragging along World Y -> Rotate X
                 moveAxis = 'x'
-                moveDir = (moveVector.y > 0 ? -1 : 1) * sign as 1 | -1
+                layer = Math.round(cube.position[0] / 1.05)
+                
+                const sign = Math.sign(normal.z)
+                const dragDir = Math.sign(result.dot)
+                moveDir = (dragDir === 1 ? -1 : 1) * sign as 1 | -1
              }
           }
 
